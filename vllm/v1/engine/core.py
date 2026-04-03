@@ -1860,7 +1860,10 @@ class DPEngineCoreProc(EngineCoreProc):
         if self.step_counter % 32 != 0:
             return True
 
-        return ParallelConfig.has_unfinished_dp(self.dp_group, local_unfinished)
+        fault_tolerant = self.vllm_config.parallel_config.enable_ep_fault_tolerance
+        return ParallelConfig.has_unfinished_dp(
+            self.dp_group, local_unfinished, fault_tolerant=fault_tolerant
+        )
 
     def reinit_dp_group_on_fault_tolerance(self, new_stateless_dp_group_port: int):
         stateless_destroy_torch_distributed_process_group(self.dp_group)
