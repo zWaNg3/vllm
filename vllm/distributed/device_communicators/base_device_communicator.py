@@ -106,6 +106,9 @@ class All2AllManagerBase:
         # index to 1 if it detects a fault, and 0 otherwise
         raise NotImplementedError
 
+    def clean_mask(self):
+        raise NotImplementedError
+
     def set_num_sms(self, num_sms: int):
         pass
 
