@@ -265,6 +265,12 @@ class EngineCoreSentinel(BaseSentinel):
         # Validate required keyword arguments
         # Extract and type-cast parameters from kwargs
         timeout = ft_request.params["timeout"]
+        original_to_new: dict[str, int] = ft_request.params["original_to_new"]
+        exclude_dp_ranks: list[int] = ft_request.params["exclude_dp_ranks"]
+        new_stateless_dp_group_port: int = ft_request.params[
+            "new_stateless_dp_group_port"
+        ]
+
         original_to_new = ft_request.params["original_to_new"]
         exclude_dp_ranks = ft_request.params["exclude_dp_ranks"]
         new_stateless_dp_group_port: int = ft_request.params[

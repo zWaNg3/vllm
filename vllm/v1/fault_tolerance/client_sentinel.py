@@ -381,7 +381,6 @@ class ClientSentinel(BaseSentinel):
                 exclude_dp_ranks, original_to_new, timeout
             )
             self.update_config(exclude_dp_ranks, original_to_new)
-            # self.engine_running.set()
             self.is_faulted.clear()
 
         return res
