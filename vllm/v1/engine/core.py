@@ -880,7 +880,7 @@ class EngineCoreProc(EngineCore):
                     engine_fault_socket_addr=ft_addresses.engine_fault_socket_addr,
                     sentinel_identity=engine_core_sentinel_ids[self.engine_index],
                     worker_cmd_addr=worker_cmd_addr,
-                    engine_core=self,
+                    engine_core=self, # type: ignore
                 )
                 self.model_executor.collective_rpc(
                     method="create_worker_sentinel",
@@ -924,24 +924,6 @@ class EngineCoreProc(EngineCore):
                     raise RuntimeError("Input socket thread died during startup")
                 assert addresses.coordinator_input is not None
                 logger.info("Waiting for READY message from DP Coordinator...")
-
-    def update_parallel_config(self, data_parallel_size, rank_mapping):
-        self.vllm_config.parallel_config.data_parallel_size = (
-            self.vllm_config.parallel_config
-        ).data_parallel_size_local = data_parallel_size
-        self.vllm_config.parallel_config.data_parallel_rank = rank_mapping.get(
-            self.vllm_config.parallel_config.data_parallel_rank,
-            self.vllm_config.parallel_config.data_parallel_rank,
-        )
-        self.vllm_config.parallel_config.data_parallel_rank_local = rank_mapping.get(
-            self.vllm_config.parallel_config.data_parallel_rank_local,
-            self.vllm_config.parallel_config.data_parallel_rank_local,
-        )
-        # self.vllm_config.parallel_config.expert_parallel_size = (
-        #     data_parallel_size * self.vllm_config.parallel_config.tensor_parallel_size
-        # )
-        # todo: Change the method of updating master_port.
-        self.vllm_config.parallel_config.data_parallel_master_port += 1000
 
     @contextmanager
     def _perform_handshakes(
@@ -1860,16 +1842,11 @@ class DPEngineCoreProc(EngineCoreProc):
         if self.step_counter % 32 != 0:
             return True
 
-        fault_tolerant = self.vllm_config.parallel_config.enable_ep_fault_tolerance
-        return ParallelConfig.has_unfinished_dp(
-            self.dp_group, local_unfinished, fault_tolerant=fault_tolerant
-        )
+        return ParallelConfig.has_unfinished_dp(self.dp_group, local_unfinished)
 
-    def reinit_dp_group_on_fault_tolerance(self, new_stateless_dp_group_port: int):
+    def reinit_dp_group_on_fault_tolerance(self):
         stateless_destroy_torch_distributed_process_group(self.dp_group)
-        self.dp_group = self.vllm_config.parallel_config.stateless_init_dp_group(
-            dp_init_port=new_stateless_dp_group_port,
-        )
+        self.dp_group = self.vllm_config.parallel_config.stateless_init_dp_group()
         self.step_counter = 0
 
     def reinitialize_distributed(

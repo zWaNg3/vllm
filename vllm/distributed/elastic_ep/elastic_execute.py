@@ -42,6 +42,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.layer import FusedMoEParallelConfig
 from vllm.v1.engine import ReconfigureDistributedRequest, ReconfigureRankType
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
+from vllm.v1.worker.sentinel.gpu_worker_sentinel import get_pause_event
 from vllm.v1.worker.workspace import lock_workspace, unlock_workspace
 
 if TYPE_CHECKING:
@@ -579,6 +580,7 @@ class ElasticEPScalingExecutor:
         reconfig_request = self.reconfig_request
         if (reconfig_request and reconfig_request.dead_dp_ranks
                 and new_dp_size < old_dp_size):
+            get_pause_event().clear()
             self.reassign_missing_experts()
 
         unlock_workspace()
@@ -831,32 +833,16 @@ class ElasticEPScalingExecutor:
     def perform_scale_down_eplb_reshuffle(
         self,
         new_dp_size: int,
-        dead_dp_ranks: list[int] | None = None,
     ) -> None:
         self._set_eplb_suppressed(True)
         parallel_config = self.worker.vllm_config.parallel_config
         tp_size = parallel_config.tensor_parallel_size
         old_ep_size = parallel_config.data_parallel_size * tp_size
         new_ep_size = new_dp_size * tp_size
-
-        if dead_dp_ranks:
-            # Fault-triggered: map dead ranks' experts to -1, compact
-            # surviving ranks to contiguous 0..new_ep_size-1.
-            dead_ep = dead_dp_to_ep_ranks(dead_dp_ranks, tp_size)
-            rank_mapping = {}
-            new_rank = 0
-            for old_ep_rank in range(old_ep_size):
-                if old_ep_rank in dead_ep:
-                    rank_mapping[old_ep_rank] = -1
-                else:
-                    rank_mapping[old_ep_rank] = new_rank
-                    new_rank += 1
-        else:
-            # Graceful: remove the highest-ranked engines.
-            rank_mapping = {
-                old_ep_rank: old_ep_rank if old_ep_rank < new_ep_size else -1
-                for old_ep_rank in range(old_ep_size)
-            }
+        rank_mapping = {
+            old_ep_rank: old_ep_rank if old_ep_rank < new_ep_size else -1
+            for old_ep_rank in range(old_ep_size)
+        }
         self._perform_eplb_reshuffle(rank_mapping=rank_mapping)
 
     def receive_weights(self) -> None:

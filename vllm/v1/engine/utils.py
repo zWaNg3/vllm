@@ -14,12 +14,12 @@ from multiprocessing.queues import Queue
 from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
 
-import msgpack
 import msgspec
 import zmq
 
 from vllm import envs
 from vllm.config import CacheConfig, ParallelConfig, VllmConfig
+from vllm.distributed import init_distributed_coordination
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.ray.ray_env import get_env_vars_to_copy
@@ -121,6 +121,10 @@ class CoreEngineProcManager:
             self.ctx, self.engine_down_socket = make_engine_down_report_socket(
                 vllm_config
             )
+        parallel_config = vllm_config.parallel_config
+        if parallel_config.enable_elastic_ep:
+            _, store = init_distributed_coordination(parallel_config)
+            self._coord_store = store
         if client_handshake_address:
             common_kwargs["client_handshake_address"] = client_handshake_address
 
@@ -183,19 +187,10 @@ class CoreEngineProcManager:
                     ),
                 ):
                     proc.start()
-            if not local_client and vllm_config.parallel_config.enable_fault_tolerance:
-                self.recv_engine_identity(start_index, local_engine_count)
         finally:
             # Kill other procs if not all are running.
             if self.finished_procs():
                 self.shutdown()
-
-    def recv_engine_identity(self, start_engine_index, local_engine_count):
-        start_engine_bytes = str(start_engine_index).encode("utf-8")
-        local_engine_count_bytes = str(local_engine_count).encode("utf-8")
-        self.engine_down_socket.send_multipart([b"", start_engine_bytes])
-        self.engine_down_socket.send_multipart([b"", local_engine_count_bytes])
-
     def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown engine core processes with configurable timeout."""
         self.manager_stopped.set()
@@ -205,30 +200,15 @@ class CoreEngineProcManager:
         if self._finalizer.detach() is not None:
             shutdown(self.processes, timeout=timeout)
 
-    def monitor_engine_liveness(self, engine_identity, run_headless=False) -> None:
+    def monitor_engine_liveness(self, engine_identity) -> None:
         """Monitor engine core process liveness."""
-        if run_headless and self.enable_fault_tolerance:
-            engine_identity = msgpack.loads(
-                self.engine_down_socket.recv_multipart()[1], strict_map_key=False
-            )
-
         sentinel_to_proc = {proc.sentinel: proc for proc in self.processes}
         sentinels = set(sentinel_to_proc.keys())
-        pids = [proc.pid for proc in self.processes]
-        pid_mapping = {}
-        if self.enable_fault_tolerance:
-            pid_mapping = {
-                proc: byte_data
-                for proc, byte_data in zip(pids, engine_identity.values())
-            }
         while sentinels and not self.manager_stopped.is_set():
             died_sentinels = connection.wait(sentinels, timeout=1)
 
             for sentinel in died_sentinels:
                 proc = sentinel_to_proc.pop(cast(int, sentinel))
-                died_proc = next(
-                    proc for proc in self.processes if proc.sentinel == sentinel
-                )
                 exitcode = proc.exitcode
                 if exitcode != 0 and not self.manager_stopped.is_set():
                     self.failed_proc_name = proc.name
@@ -237,7 +217,6 @@ class CoreEngineProcManager:
                     notify_engine_down(
                         self.engine_down_socket,
                         engine_id=str(engine_rank + self.start_index),
-                        engine_identity=pid_mapping[died_proc.pid],
                     )
                     sentinels.remove(cast(int, sentinel))
 
@@ -245,45 +224,6 @@ class CoreEngineProcManager:
                 break
 
         self.shutdown()
-
-    def monitor_engine_liveness_fault_tolerant(
-        self,
-        on_engine_died: Callable[[str, int], bool],
-    ) -> None:
-        """Monitor engine liveness, reporting individual failures.
-
-        Args:
-            on_engine_died: Called with (proc_name, dp_rank) when a process
-                dies unexpectedly. Return True to continue monitoring
-                surviving engines, False to stop.
-        """
-        sentinel_to_proc = {proc.sentinel: proc for proc in self.processes}
-        sentinels = set(sentinel_to_proc.keys())
-
-        while sentinels and not self.manager_stopped.is_set():
-            died_sentinels = connection.wait(sentinels, timeout=1)
-
-            for sentinel in died_sentinels:
-                sentinels.discard(cast(int, sentinel))
-                proc = sentinel_to_proc.pop(cast(int, sentinel))
-                exitcode = proc.exitcode or 0
-                if exitcode != 0 and not self.manager_stopped.is_set():
-                    self.failed_proc_name = proc.name
-                    dp_rank = self._dp_rank_from_proc_name(proc.name)
-                    should_continue = on_engine_died(proc.name, dp_rank)
-                    if not should_continue:
-                        self.shutdown()
-                        return
-
-        self.shutdown()
-
-    @staticmethod
-    def _dp_rank_from_proc_name(name: str) -> int:
-        prefix = "EngineCore_DP"
-        if name.startswith(prefix):
-            return int(name[len(prefix) :])
-        return -1
-
     def sentinels(self) -> list:
         return [proc.sentinel for proc in self.processes]
 
@@ -1050,46 +990,6 @@ class CoreEngineActorManager:
 
             if unexpected_failure and not self.enable_fault_tolerance:
                 break
-        self.shutdown()
-
-    def monitor_engine_liveness_fault_tolerant(
-        self,
-        on_engine_died: Callable[[str, int], bool],
-    ) -> None:
-        """Monitor engine liveness, reporting individual failures.
-
-        Args:
-            on_engine_died: Called with (actor_name, dp_rank) when an actor
-                dies unexpectedly. Return True to continue monitoring
-                surviving engines, False to stop.
-        """
-        import ray
-
-        while not self.manager_stopped.is_set():
-            actor_run_refs = list(self.get_run_refs())
-            if not actor_run_refs:
-                logger.info(
-                    "There are no actors to monitor currently. "
-                    "The monitoring function is about to terminate."
-                )
-                break
-            actor_done_refs, _ = ray.wait(actor_run_refs, timeout=5)
-            for actor_ref in actor_done_refs:
-                if self.manager_stopped.is_set():
-                    break
-                if actor_ref not in self.get_run_refs():
-                    continue
-                try:
-                    ray.get(actor_ref)
-                except ray.exceptions.RayActorError:
-                    actor_name = f"Actor {actor_ref}"
-                    self.failed_proc_name = actor_name
-                    dp_rank = self.run_ref_to_dp_rank.get(actor_ref, -1)
-                    should_continue = on_engine_died(actor_name, dp_rank)
-                    if not should_continue:
-                        self.shutdown()
-                        return
-
         self.shutdown()
 
     def shutdown(self, timeout: float | None = None) -> None:

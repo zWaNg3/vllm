@@ -12,7 +12,7 @@ import zmq
 
 from vllm.config import FaultToleranceConfig
 from vllm.utils.network_utils import make_zmq_socket
-from vllm.v1.engine import EngineStatusType
+from vllm.v1.engine import EngineStatusType, ReconfigureDistributedRequest
 from vllm.v1.utils import get_engine_client_zmq_addr
 
 FAULT_STATE_PUB_TOPIC = "vllm_fault"
@@ -165,16 +165,14 @@ def make_engine_down_report_socket(vllm_config):
     return zmq_ctx, engine_down_socket
 
 
-def notify_engine_down(engine_down_socket, engine_id, engine_identity):
+def notify_engine_down(engine_down_socket, engine_id):
     fault_info = FaultInfo(
         type="EngineDeadError",
         message="Engine died unexpectedly.",
         engine_id=str(engine_id),
-        engine_identity=engine_identity,
         engine_status=EngineStatusType.DEAD,
     )
     # During normal shutdown, the DEALER socket may already be closed.
     # Sending the final fault report can then raise ZMQError, which is safe to ignore.
-    print(f"notify_engine_down fault_info is {fault_info}")
     with contextlib.suppress(zmq.ZMQError):
         engine_down_socket.send_multipart([b"", msgspec.msgpack.encode(fault_info)])

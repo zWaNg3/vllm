@@ -6,6 +6,7 @@ import threading
 import time
 import traceback
 import uuid
+import weakref
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -13,10 +14,10 @@ import msgspec.msgpack
 import zmq
 
 from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
-from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.logger import init_logger
 from vllm.utils.network_utils import close_sockets, make_zmq_socket
-from vllm.v1.engine import EngineCoreRequestType, EngineStatusType
+from vllm.v1.engine import EngineCoreRequestType, EngineStatusType, \
+    ReconfigureDistributedRequest
 from vllm.v1.engine.exceptions import EngineLoopPausedError
 from vllm.v1.fault_tolerance.sentinel import BaseSentinel
 from vllm.v1.fault_tolerance.utils import (
@@ -27,7 +28,7 @@ from vllm.v1.fault_tolerance.utils import (
 from vllm.v1.serial_utils import run_method
 
 if TYPE_CHECKING:
-    from vllm.v1.engine.core import EngineCoreProc
+    from vllm.v1.engine.core import DPEngineCoreProc
 
 logger = init_logger(__name__)
 
@@ -48,15 +49,15 @@ class EngineCoreSentinel(BaseSentinel):
         engine_fault_socket_addr: str,
         sentinel_identity: bytes,
         worker_cmd_addr: str,
-        engine_core: "EngineCoreProc",
+        engine_core: "DPEngineCoreProc",
     ):
+        self.engine_core_ref = weakref.ref(engine_core)
         self.engine_index = engine_index
         super().__init__(
             parallel_config,
             f"DP_{engine_index}",
             sentinel_identity,
         )
-        self.engine_core = engine_core
         self.data_parallel_size = parallel_config.data_parallel_size
         self.fault_signal_q: queue.Queue[Exception] = queue.Queue()
         self.cmd_q: queue.Queue[FaultToleranceRequest | None] = queue.Queue(maxsize=1)
@@ -93,6 +94,13 @@ class EngineCoreSentinel(BaseSentinel):
         threading.Thread(
             target=self.run, daemon=True, name="EngineCoreSentinelMonitorThread"
         ).start()
+
+    @property
+    def engine_core(self) -> "DPEngineCoreProc":
+        engine_core = self.engine_core_ref()
+        if engine_core is None:
+            raise RuntimeError("Engine core has been garbage collected")
+        return engine_core
 
     def run(self):
         """Continuously poll for fault signals and report to client sentinel."""
@@ -183,79 +191,7 @@ class EngineCoreSentinel(BaseSentinel):
             reason=None if True else "Worker don't recovered within timeout.",
         )
 
-    def _calculate_exclude_ep_ranks(
-        self, exclude_dp_ranks: list[int], vllm_config: VllmConfig
-    ) -> list[int]:
-        """Calculate excluded EP ranks from excluded DP ranks."""
-        tensor_model_parallel_size = vllm_config.parallel_config.tensor_parallel_size
-        exclude_ep_ranks: list[int] = []
-        for dp_rank in exclude_dp_ranks:
-            start = dp_rank * tensor_model_parallel_size
-            end = (dp_rank + 1) * tensor_model_parallel_size
-            exclude_ep_ranks.extend(range(start, end))
-
-        exclude_ep_ranks = sorted(list(set(exclude_ep_ranks)))
-        return exclude_ep_ranks
-
-    def _calculate_parallel_config(
-        self, vllm_config: VllmConfig, exclude_dp_ranks_list: list[int]
-    ):
-        """Parse excluded DP ranks to
-        calculate scaled-down EP/DP sizes and DP rank mapping."""
-        if vllm_config.parallel_config.pipeline_parallel_size > 1:
-            raise NotImplementedError(
-                "Pipeline parallel is not supported for scaling down."
-            )
-        tp_size = vllm_config.parallel_config.tensor_parallel_size
-        old_dp_size = vllm_config.parallel_config.data_parallel_size
-
-        new_dp_size = old_dp_size - len(exclude_dp_ranks_list)
-        new_ep_size = new_dp_size * tp_size
-
-        return new_ep_size, new_dp_size
-
-    def _build_vllm_config_update_dict(
-        self,
-        parallel_config: Any,
-        new_ep_size: int,
-        data_parallel_size: int,
-        rank_mapping: Any,
-    ) -> dict[str, Any]:
-        """Build dictionary of VLLM config updates for downstream workers.
-
-        Args:
-            parallel_config: Current parallel configuration object
-            new_ep_size: New expert parallelism size
-            data_parallel_size: New data parallelism size
-            rank_mapping: New rank mapping after exclusion
-
-        Returns:
-            Dict[str, Any]: VLLM configuration update parameters
-        """
-        return {
-            "ep_world_size": new_ep_size,
-            "rank_mapping": rank_mapping,
-            "data_parallel_size": data_parallel_size,
-            "data_parallel_rank": parallel_config.data_parallel_rank,
-            "data_parallel_size_local": parallel_config.data_parallel_size_local,
-            "expert_parallel_size": (
-                data_parallel_size
-                * parallel_config.pipeline_parallel_size
-                * parallel_config.tensor_parallel_size
-            ),
-            "data_parallel_master_port": parallel_config.data_parallel_master_port,
-        }
-
-    def reinit_dp_group_on_fault_tolerance(self, new_stateless_dp_group_port):
-        stateless_destroy_torch_distributed_process_group(self.engine_core.dp_group)
-        self.engine_core.dp_group = (
-            self.engine_core.vllm_config.parallel_config.stateless_init_dp_group(
-                dp_init_port=new_stateless_dp_group_port
-            )
-        )
-        self.engine_core.step_counter = 0
-
-    def descale(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
+    def scale_down(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
         """Scale down the engine cluster by removing specified DP ranks.
 
         This method adjusts parallel configuration parameters,
@@ -265,58 +201,22 @@ class EngineCoreSentinel(BaseSentinel):
         # Validate required keyword arguments
         # Extract and type-cast parameters from kwargs
         timeout = ft_request.params["timeout"]
-        original_to_new: dict[str, int] = ft_request.params["original_to_new"]
-        exclude_dp_ranks: list[int] = ft_request.params["exclude_dp_ranks"]
-        new_stateless_dp_group_port: int = ft_request.params[
-            "new_stateless_dp_group_port"
-        ]
+        old_to_new: dict[int, int] = ft_request.params["old_to_new"]
+        reconfig_request: ReconfigureDistributedRequest = ReconfigureDistributedRequest(**ft_request.params["reconfig_request"])
+        reconfig_request.new_data_parallel_rank = old_to_new[self.engine_index]
 
-        original_to_new = ft_request.params["original_to_new"]
-        exclude_dp_ranks = ft_request.params["exclude_dp_ranks"]
-        new_stateless_dp_group_port: int = ft_request.params[
-            "new_stateless_dp_group_port"
-        ]
-        logger.info(f'original_to_new is {original_to_new}')
+        old_to_new = ft_request.params["old_to_new"]
         deadline = time.monotonic() + timeout
-        original_to_new = {int(k): v for k,v in original_to_new.items()}
-        self.engine_index = original_to_new[self.engine_index]
-        exclude_ep_ranks = self._calculate_exclude_ep_ranks(
-            exclude_dp_ranks, self.engine_core.vllm_config
-        )
 
-        new_ep_size, data_parallel_size = self._calculate_parallel_config(
-            self.engine_core.vllm_config, exclude_dp_ranks
-        )
-        with set_current_vllm_config(self.engine_core.vllm_config):
-            parallel_config = self.engine_core.vllm_config.parallel_config
-            self.engine_core.update_parallel_config(data_parallel_size, original_to_new)
-            vllm_config_update_dict = self._build_vllm_config_update_dict(
-                parallel_config, new_ep_size, data_parallel_size, original_to_new
-            )
-            descale_request = FaultToleranceRequest.builder(
-                request_id=str(uuid.uuid4()),
-                instruction="descale",
-                params={
-                    "timeout": timeout,
-                    "exclude_ep_ranks": exclude_ep_ranks,
-                    "vllm_config_update_dict": vllm_config_update_dict,
-                },
-            )
+        self.engine_index = old_to_new[self.engine_index]
+        # Considering that elastic_ep only executes _progress_remaining_engine in fault
+        # scenarios and the steps are fixed, we can decouple from the progress method of
+        # elastic_ep and directly execute _create_standby_groups(),_switch_and_prepare(),
+        # and _update_parallel_config() in the fault-tolerant framework.
+        self.engine_core.reinitialize_distributed(reconfig_request)
+        self.engine_core.eep_scaling_state.apply_reconfiguration()
 
-            self._execute_command_on_workers(
-                FaultToleranceRequest(
-                    str(uuid.uuid4()), "descale", descale_request.params
-                ),
-                self.worker_identities,
-                timeout=timeout,
-            )
-
-        reinit_request = FaultToleranceRequest(
-            instruction="reinit_dp_group_on_fault_tolerance",
-            request_id=str(uuid.uuid4()),
-            params={"new_stateless_dp_group_port": new_stateless_dp_group_port},
-        )
-        self.cmd_q.put(reinit_request)
+        self.cmd_q.put(None)
 
         remaining_timeout = max(0, deadline - time.monotonic())
         success = self.busy_loop_paused.wait(remaining_timeout)
@@ -383,14 +283,7 @@ class EngineCoreSentinel(BaseSentinel):
     def shutdown_engine_core(
         self, ft_request: FaultToleranceRequest
     ) -> FaultToleranceResult:
-        shutdown_request = FaultToleranceRequest(
-            instruction="shutdown",
-            request_id=str(uuid.uuid4()),
-            params={},
-        )
-
-        self.cmd_q.put(shutdown_request)
-
+        self.engine_core.shutdown()
         return FaultToleranceResult(
             request_id=ft_request.request_id,
             success=True,

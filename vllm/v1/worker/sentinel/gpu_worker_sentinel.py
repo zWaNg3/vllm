@@ -126,6 +126,9 @@ class WorkerSentinel(BaseSentinel):
         )
         return FaultToleranceResult(ft_request.request_id, True)
 
+    def scale_down(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
+        return FaultToleranceResult(ft_request.request_id, False)
+
     def shutdown(self):
         close_sockets([self.engine_core_cmd_socket])
         super().shutdown()
