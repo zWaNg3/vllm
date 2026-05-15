@@ -350,6 +350,10 @@ class ClientSentinel(BaseSentinel):
             if self.engine_status_dict[faulty_rank]["status"] != "dead":
                 self.engine_status_dict[faulty_rank]["status"] = "dead"
 
+        ip, store = init_distributed_coordination(self.parallel_config)
+        self._coord_store = store
+        ft_request.params["coord_store_port"] = self.parallel_config._coord_store_port
+
         healthy_ranks_old = [
             engine_id for engine_id, status in self.engine_status_dict.items()
         ]

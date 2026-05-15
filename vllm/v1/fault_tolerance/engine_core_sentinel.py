@@ -27,7 +27,7 @@ from vllm.v1.fault_tolerance.utils import (
 from vllm.v1.serial_utils import run_method
 
 if TYPE_CHECKING:
-    from vllm.v1.engine.core import EngineCoreProc
+    from vllm.v1.engine.core import DPEngineCoreProc
 
 logger = init_logger(__name__)
 
@@ -48,7 +48,7 @@ class EngineCoreSentinel(BaseSentinel):
         engine_fault_socket_addr: str,
         sentinel_identity: bytes,
         worker_cmd_addr: str,
-        engine_core: "EngineCoreProc",
+        engine_core: "DPEngineCoreProc",
     ):
         self.engine_index = engine_index
         super().__init__(
@@ -267,9 +267,7 @@ class EngineCoreSentinel(BaseSentinel):
         timeout = ft_request.params["timeout"]
         original_to_new = ft_request.params["original_to_new"]
         exclude_dp_ranks = ft_request.params["exclude_dp_ranks"]
-        new_stateless_dp_group_port: int = ft_request.params[
-            "new_stateless_dp_group_port"
-        ]
+        self.parallel_config._coord_store_port = ft_request.params["coord_store_port"]
         logger.info(f'original_to_new is {original_to_new}')
         deadline = time.monotonic() + timeout
         original_to_new = {int(k): v for k,v in original_to_new.items()}
@@ -305,12 +303,7 @@ class EngineCoreSentinel(BaseSentinel):
                 timeout=timeout,
             )
 
-        reinit_request = FaultToleranceRequest(
-            instruction="reinit_dp_group_on_fault_tolerance",
-            request_id=str(uuid.uuid4()),
-            params={"new_stateless_dp_group_port": new_stateless_dp_group_port},
-        )
-        self.cmd_q.put(reinit_request)
+        self.engine_core.reinit_dp_group_on_fault_tolerance()
 
         remaining_timeout = max(0, deadline - time.monotonic())
         success = self.busy_loop_paused.wait(remaining_timeout)
