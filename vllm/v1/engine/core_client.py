@@ -1232,16 +1232,16 @@ class AsyncMPClient(MPClient):
         self, ft_request: FaultToleranceRequest
     ) -> FaultToleranceResult:
         # Reject fault tolerance instructions if any engine is not healthy.
-        hung_engines = [
+        healthy_engines = [
             e
             for e in self.engine_status["engines"]  # type: ignore[attr-defined]
             if e["status"] == EngineStatusType.HEALTHY.name.lower()
         ]
-        if hung_engines:
+        if healthy_engines:
             return FaultToleranceResult(
                 request_id=ft_request.request_id,
                 success=False,
-                reason=f"Some Engines are still hung: {hung_engines}",
+                reason=f"Some Engines are still hung: {healthy_engines}",
             )
 
         res = await self._call_utility_async(
@@ -1256,12 +1256,27 @@ class AsyncMPClient(MPClient):
                 frames = self.fault_state_sub_socket.recv_multipart()
                 msg = decoder.decode(frames[-1])
                 with self.engine_status_lock:
-                    self.engine_status = msg
+                    self.engine_status = {
+                        "total_engines": msg["total_engines"],
+                        "engines": msg["engines"],
+                    }
                     if "original_to_new" in msg and "exclude_dp_ranks" in msg:
-                        self._apply_scale_down_config(
-                            msg["exclude_dp_ranks"],
-                            msg["original_to_new"],
+                        loop = (
+                            self.resources.output_queue_task.get_loop()
+                            if self.resources.output_queue_task
+                            else None
                         )
+                        if loop and loop.is_running():
+                            loop.call_soon_threadsafe(
+                                self._apply_scale_down_config,
+                                msg["exclude_dp_ranks"],
+                                msg["original_to_new"],
+                            )
+                        else:
+                            self._apply_scale_down_config(
+                                msg["exclude_dp_ranks"],
+                                msg["original_to_new"],
+                            )
             except zmq.ZMQError:
                 break
 
@@ -1304,7 +1319,9 @@ class AsyncMPClient(MPClient):
                 ("SCALE_ELASTIC_EP", new_dp_size)
             )
             if self.resources.first_req_send_socket:
-                self.resources.first_req_send_socket.send(scale_down_marker)
+                zmq.Socket.shadow(self.resources.first_req_send_socket).send(
+                    scale_down_marker
+                )
 
     async def fault_reporter(self):
         with self.engine_status_lock:
