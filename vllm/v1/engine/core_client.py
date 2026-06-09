@@ -1256,27 +1256,12 @@ class AsyncMPClient(MPClient):
                 frames = self.fault_state_sub_socket.recv_multipart()
                 msg = decoder.decode(frames[-1])
                 with self.engine_status_lock:
-                    self.engine_status = {
-                        "total_engines": msg["total_engines"],
-                        "engines": msg["engines"],
-                    }
-                    if msg["type"] == "scale_down":
-                        loop = (
-                            self.resources.output_queue_task.get_loop()
-                            if self.resources.output_queue_task
-                            else None
+                    self.engine_status = msg
+                    if "original_to_new" in msg and "exclude_dp_ranks" in msg:
+                        self._apply_scale_down_config(
+                            msg["exclude_dp_ranks"],
+                            msg["original_to_new"],
                         )
-                        if loop and loop.is_running():
-                            loop.call_soon_threadsafe(
-                                self._apply_scale_down_config,
-                                msg["exclude_dp_ranks"],
-                                msg["original_to_new"],
-                            )
-                        else:
-                            self._apply_scale_down_config(
-                                msg["exclude_dp_ranks"],
-                                msg["original_to_new"],
-                            )
             except zmq.ZMQError:
                 break
 
@@ -1297,8 +1282,6 @@ class AsyncMPClient(MPClient):
             for rank, identity in zip(self.engine_ranks_managed, self.core_engines)
             if rank not in exclude_set
         ]
-        if self.core_engines:
-            self.core_engine = self.core_engines[0]
 
         # 2. Reset engine_ranks_managed to contiguous range [0, new_dp_size).
         new_dp_size = len(old_to_new)
@@ -1321,9 +1304,7 @@ class AsyncMPClient(MPClient):
                 ("SCALE_ELASTIC_EP", new_dp_size)
             )
             if self.resources.first_req_send_socket:
-                zmq.Socket.shadow(self.resources.first_req_send_socket).send(
-                    scale_down_marker
-                )
+                self.resources.first_req_send_socket.send(scale_down_marker)
 
     async def fault_reporter(self):
         with self.engine_status_lock:
