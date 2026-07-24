@@ -8,7 +8,8 @@ import torch
 import torch.distributed as dist
 
 import vllm.envs as envs
-from vllm.distributed import get_dp_group, get_ep_group
+from vllm.config import get_current_vllm_config
+from vllm.distributed import get_dp_group, get_ep_group, get_pcp_group
 from vllm.distributed.utils import StatelessProcessGroup
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -263,6 +264,9 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
 
     def __init__(self, cpu_group, tcp_store_group=None):
         super().__init__(cpu_group, tcp_store_group)
+        self.support_fault_tolerance = (
+            get_current_vllm_config().parallel_config.enable_fault_tolerance
+        )
 
     def _make_all2all_kwargs(
         self,
@@ -324,6 +328,33 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
     # DeepEP LL uses RDMA so no SMs are used for communication
     def max_sms_used(self) -> int | None:
         return 0
+
+    def query_active_mask(self) -> torch.Tensor:
+        buf = DeepEPLLAll2AllManager._buffer
+        assert buf is not None
+        if DeepEPLLAll2AllManager._mask is None:
+            DeepEPLLAll2AllManager._mask = torch.zeros(
+                self.world_size, device="cuda", dtype=torch.int32
+            )
+        buf.low_latency_query_mask_buffer(DeepEPLLAll2AllManager._mask)
+        return DeepEPLLAll2AllManager._mask
+
+    def query_fault(self) -> torch.Tensor:
+        current = self.query_active_mask()
+        if DeepEPLLAll2AllManager._last_mask is None:
+            DeepEPLLAll2AllManager._last_mask = torch.zeros_like(current)
+        has_fault = (current != DeepEPLLAll2AllManager._last_mask).any()
+        return has_fault
+
+    def clean_buffers(self) -> None:
+        buf = DeepEPLLAll2AllManager._buffer
+        if buf is None:
+            return
+        buf.get_local_buffer_tensor(dtype=torch.int8, use_rdma_buffer=True).zero_()
+        torch.accelerator.synchronize()
+        buf.low_latency_clean_mask_buffer()
+        torch.accelerator.synchronize()
+        DeepEPLLAll2AllManager._last_mask = None
 
 
 @dataclass
@@ -507,6 +538,37 @@ class NixlEPAll2AllManager(All2AllManagerBase):
     # NIXL EP uses RDMA so no SMs are used for communication
     def max_sms_used(self) -> int | None:
         return 0
+
+    def query_active_mask(self) -> torch.Tensor:
+        state = NixlEPAll2AllManager._buffer
+        assert state is not None
+        if NixlEPAll2AllManager._mask is None:
+            NixlEPAll2AllManager._mask = torch.zeros(
+                self.max_num_ep_ranks, device="cuda", dtype=torch.int32
+            )
+        state.buffer.query_mask_buffer(NixlEPAll2AllManager._mask)
+        return NixlEPAll2AllManager._mask[: state.active_ep_size]
+
+    def query_fault(self) -> torch.Tensor:
+        current = self.query_active_mask()
+        last = NixlEPAll2AllManager._last_mask
+        if last is None or last.shape != current.shape:
+            NixlEPAll2AllManager._last_mask = torch.zeros_like(current)
+            last = NixlEPAll2AllManager._last_mask
+        has_fault = (current != last).any()
+        return has_fault
+
+    def clean_buffers(self) -> None:
+        if NixlEPAll2AllManager._buffer is None:
+            return
+        state = NixlEPAll2AllManager._buffer
+        state.buffer.get_local_buffer_tensor(
+            dtype=torch.int8, use_rdma_buffer=True
+        ).zero_()
+        torch.accelerator.synchronize()
+        state.buffer.clean_mask_buffer()
+        torch.accelerator.synchronize()
+        NixlEPAll2AllManager._last_mask = None
 
 
 class FlashInferNVLinkTwoSidedManager(All2AllManagerBase):
