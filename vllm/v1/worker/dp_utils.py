@@ -5,7 +5,7 @@ import torch
 import torch.distributed as dist
 
 from vllm.config import ParallelConfig
-from vllm.distributed.parallel_state import get_dp_group
+from vllm.distributed.parallel_state import get_dp_group, get_tp_group
 from vllm.logger import init_logger
 from vllm.v1.worker.ubatch_utils import (
     check_ubatch_thresholds,
@@ -149,10 +149,27 @@ def _synchronize_dp_ranks(
         parallel_config=parallel_config,
     )
 
-    # Synchronize cudagraph_mode across ranks first (take min).
-    # This is needed before DP padding decision since we use the synced
-    # cudagraph mode to determine whether DP padding is needed.
-    synced_cudagraph_mode = _post_process_cudagraph_mode(tensor)
+    # Per-step barrier over the TP cpu group: a faulted sibling stops
+    # arriving, so survivors fail here on the host instead of leaving
+    # an orphaned TP collective running on device.
+    if (
+        parallel_config.enable_fault_tolerance
+        and parallel_config.tensor_parallel_size > 1
+    ):
+        dist.barrier(group=get_tp_group().cpu_group)
+
+    # Only the NCCL path leaves `tensor` on device. With Gloo -- the default
+    # under async scheduling -- the all-reduce runs on CPU, so the reads below
+    # are host-side and the check should stay armed.
+    with (
+        nullcontext()
+        if parallel_config.disable_nccl_for_dp_synchronization
+        else gpu_sync_allowed()
+    ):
+        # Synchronize cudagraph_mode across ranks first (take min).
+        # This is needed before DP padding decision since we use the synced
+        # cudagraph mode to determine whether DP padding is needed.
+        synced_cudagraph_mode = _post_process_cudagraph_mode(tensor)
 
     # Check conditions for microbatching
     should_ubatch = _post_process_ubatch(tensor, parallel_config.num_ubatches)
