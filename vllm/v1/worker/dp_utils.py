@@ -5,7 +5,7 @@ import torch
 import torch.distributed as dist
 
 from vllm.config import ParallelConfig
-from vllm.distributed.parallel_state import get_dp_group
+from vllm.distributed.parallel_state import get_dp_group, get_tp_group
 from vllm.logger import init_logger
 from vllm.v1.worker.ubatch_utils import (
     check_ubatch_thresholds,
@@ -33,6 +33,17 @@ def _get_device_and_group(parallel_config: ParallelConfig):
     return device, group
 
 
+_INT32_MAX = torch.iinfo(torch.int32).max
+
+
+def neutralize_dead_dp_columns(tensor: torch.Tensor, dead_dp_ranks: set[int]) -> None:
+    """Fill dead ranks' zero columns with aggregate-neutral values"""
+    for r in dead_dp_ranks:
+        tensor[0][r] = _INT32_MAX
+        tensor[2][r] = 1
+        tensor[3][r] = _INT32_MAX
+
+
 def _run_ar(
     should_ubatch: bool,
     orig_num_tokens_per_ubatch: int,
@@ -51,6 +62,8 @@ def _run_ar(
     tensor_cpu[3][dp_rank] = cudagraph_mode
     tensor = tensor_cpu.to(device, non_blocking=True)
     dist.all_reduce(tensor, group=group)
+    if dead_dp_ranks := get_dp_group().dead_dp_ranks:
+        neutralize_dead_dp_columns(tensor, dead_dp_ranks)
     return tensor
 
 
@@ -135,6 +148,15 @@ def _synchronize_dp_ranks(
         cudagraph_mode=cudagraph_mode,
         parallel_config=parallel_config,
     )
+
+    # Per-step barrier over the TP cpu group: a faulted sibling stops
+    # arriving, so survivors fail here on the host instead of leaving
+    # an orphaned TP collective running on device.
+    if (
+        parallel_config.enable_fault_tolerance
+        and parallel_config.tensor_parallel_size > 1
+    ):
+        dist.barrier(group=get_tp_group().cpu_group)
 
     # Synchronize cudagraph_mode across ranks first (take min).
     # This is needed before DP padding decision since we use the synced
