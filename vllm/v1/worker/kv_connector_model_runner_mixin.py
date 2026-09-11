@@ -93,23 +93,25 @@ class KVConnectorModelRunnerMixin:
         # involved may be disjoint from the running requests.
         # Do this here to save a collective_rpc.
         kv_connector.start_load_kv(get_forward_context())
-        try:
-            yield output
-        finally:
-            if wait_for_save and not defer_finalize:
-                kv_connector.wait_for_save()
+        yield output
 
-            output.finished_sending, output.finished_recving = (
-                kv_connector.get_finished(scheduler_output.finished_req_ids)
-            )
-            output.invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
+        # If _model_forward raises, skip collecting KV transfer state here;
+        # it accumulates in kv_connector and is returned on the next
+        # successful execution.
+        if wait_for_save and not defer_finalize:
+            kv_connector.wait_for_save()
 
-            output.kv_connector_stats = kv_connector.get_kv_connector_stats()
-            output.kv_cache_events = kv_connector.get_kv_connector_kv_cache_events()
-            output.kv_connector_worker_meta = kv_connector.build_connector_worker_meta()
+        output.finished_sending, output.finished_recving = kv_connector.get_finished(
+            scheduler_output.finished_req_ids
+        )
+        output.invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
 
-            if not defer_finalize:
-                kv_connector.clear_connector_metadata()
+        output.kv_connector_stats = kv_connector.get_kv_connector_stats()
+        output.kv_cache_events = kv_connector.get_kv_connector_kv_cache_events()
+        output.kv_connector_worker_meta = kv_connector.build_connector_worker_meta()
+
+        if not defer_finalize:
+            kv_connector.clear_connector_metadata()
 
     @staticmethod
     def use_uniform_kv_cache(
