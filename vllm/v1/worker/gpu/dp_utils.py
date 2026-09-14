@@ -30,7 +30,7 @@ def sync_cudagraph_and_dp_padding(
     """
     Coordinates the batch descriptor and DP padding across all ranks.
 
-    Returns (synced_batch_desc, num_tokens_across_dp).
+    Returns (synced_batch_desc, sync). `sync` is None when no rank has work.
     """
     assert dp_size > 1, "DP size must be greater than 1"
     group = get_dp_group().cpu_group
