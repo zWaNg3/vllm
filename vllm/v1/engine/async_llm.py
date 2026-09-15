@@ -21,13 +21,7 @@ from vllm.distributed.weight_transfer.base import (
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.protocol import EngineClient, StreamingInput
 from vllm.entrypoints.serve.elastic_ep.middleware import set_scaling_elastic_ep
-from vllm.exceptions import (
-    EngineFaultedError,
-    MaxQueuedTokensError,
-    QueueOverflowError,
-    VLLMClientError,
-    VLLMValidationError,
-)
+from vllm.exceptions import VLLMClientError, VLLMValidationError
 from vllm.inputs import EngineInput, PromptType
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -278,77 +272,6 @@ class AsyncLLM(EngineClient):
         handler = getattr(self, "output_handler", None)
         if handler is not None:
             cancel_task_threadsafe(handler)
-
-    def get_num_unfinished_requests(self) -> int:
-        return self.output_processor.get_num_unfinished_requests()
-
-    def get_num_queued_tokens(self) -> int:
-        return self.output_processor.get_num_queued_tokens()
-
-    def check_admission(self, n: int = 1, request_id: str | None = None) -> None:
-        """Reject the request if it would exceed queue limits.
-
-        Both limits return HTTP 503 (Service Unavailable) so that load
-        balancers and client SDKs retry on a different instance.
-
-        - ``max_num_queued_reqs``: hard cap on the number of unfinished requests
-          (waiting + running).  A request with ``n > 1`` counts as ``n`` slots.
-        - ``max_num_queued_tokens``: TTFT QoS — cap on the total prompt
-          tokens of requests still in prefill.
-
-        Note: ``get_num_queued_tokens`` uses ``prompt_len`` for all prefilling requests.
-        Chunked prefill progress and prefix-cache hits are not subtracted because the
-        scheduler's ``num_computed_tokens`` and ``num_cached_tokens`` are only
-        propagated to the API server after prefill completes. The overestimation is
-        conservative — earlier rejection, preserving TTFT targets.
-
-        Args:
-            n: Number of sequences the request will occupy.
-            request_id: Request id, used for logging only.
-
-        Raises:
-            EngineFaultedError: If the engine has faulted and is awaiting
-                FT recovery.
-            QueueOverflowError: If ``max_num_queued_reqs`` would be exceeded.
-            MaxQueuedTokensError: If ``max_num_queued_tokens`` would be exceeded.
-        """
-        if (
-            self.vllm_config.parallel_config.enable_fault_tolerance
-            and self.engine_core.engine_status.get("status") != "healthy"
-        ):
-            logger.info(
-                "Engine %s - rejecting request %s.",
-                self.engine_core.engine_status.get("status"),
-                request_id,
-            )
-            raise EngineFaultedError()
-
-        max_num_reqs = self.scheduler_config.max_num_queued_reqs
-        if max_num_reqs is not None:
-            current = self.get_num_unfinished_requests()
-            if current + n > max_num_reqs:
-                logger.info(
-                    "Request queue full - rejecting request %s "
-                    "(current=%d, n=%d, max=%d).",
-                    request_id,
-                    current,
-                    n,
-                    max_num_reqs,
-                )
-                raise QueueOverflowError()
-
-        max_queued_tokens = self.scheduler_config.max_num_queued_tokens
-        if max_queued_tokens is not None:
-            current_tokens = self.get_num_queued_tokens()
-            if current_tokens >= max_queued_tokens:
-                logger.info(
-                    "Max queued tokens reached - rejecting request %s "
-                    "(current_tokens=%d, max=%d).",
-                    request_id,
-                    current_tokens,
-                    max_queued_tokens,
-                )
-                raise MaxQueuedTokensError()
 
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         if not hasattr(self, "_supported_tasks"):
