@@ -117,6 +117,8 @@ class VLLMUnprocessableEntityError(VLLMClientError):
         if self.value is not None:
             extras.append(f"value={self.value}")
         return f"{base} ({', '.join(extras)})" if extras else base
+
+
 class GracefulHTTPError(VLLMError):
     """Exception that should be translated into an HTTP error response.
 
@@ -130,6 +132,37 @@ class GracefulHTTPError(VLLMError):
         super().__init__(message)
         self.message = message
         self.http_status = http_status
+
+
+class QueueOverflowError(GracefulHTTPError):
+    """Raised when admitting a request would exceed the request queue limit.
+
+    Returns HTTP 503 (Service Unavailable) so that load balancers and
+    client SDKs retry the request on a different instance.
+    """
+
+    def __init__(self):
+        super().__init__(
+            "The engine is currently busy and cannot accept new requests. "
+            "Please try again later or on a different instance.",
+            HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+
+
+class MaxQueuedTokensError(GracefulHTTPError):
+    """Raised when the pending prefill tokens exceed the configured limit.
+
+    Returns HTTP 503 (Service Unavailable) so that load balancers and
+    client SDKs retry the request on a different instance.
+    """
+
+    def __init__(self):
+        super().__init__(
+            "The engine has reached its prefill token backlog limit. "
+            "Please try again later or on a different instance.",
+            HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+
 
 class EngineFaultedError(GracefulHTTPError):
     """Raised when the engine has faulted and is awaiting FT recovery.

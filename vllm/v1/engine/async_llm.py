@@ -23,7 +23,6 @@ from vllm.engine.protocol import EngineClient, StreamingInput
 from vllm.entrypoints.serve.elastic_ep.middleware import set_scaling_elastic_ep
 from vllm.exceptions import (
     EngineFaultedError,
-    GracefulHTTPError,
     MaxQueuedTokensError,
     QueueOverflowError,
     VLLMClientError,
