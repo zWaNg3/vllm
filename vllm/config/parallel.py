@@ -846,9 +846,8 @@ class ParallelConfig:
         aggregated_has_unfinished = bool(tensor.item())
         return aggregated_has_unfinished
 
-    @staticmethod
     def sync_dp_state(
-        dp_group: ProcessGroup, has_unfinished: bool, pending_pause: bool
+        self, dp_group: ProcessGroup, has_unfinished: bool, pending_pause: bool
     ) -> tuple[bool, bool]:
         """Combined all-reduce for DP state synchronization.
 
