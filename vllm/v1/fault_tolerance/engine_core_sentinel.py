@@ -148,8 +148,7 @@ class EngineCoreSentinel:
         engine = self.engine
         aborted = engine.scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
         engine._send_abort_outputs(aborted)
-        if engine.batch_queue is not None:
-            engine.batch_queue.clear()
+
         if (
             hasattr(engine.model_executor, "is_failed")
             and engine.model_executor.is_failed
